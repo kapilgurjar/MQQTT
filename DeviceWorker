@@ -1,0 +1,520 @@
+package com.mircom.iot.model;
+import java.nio.charset.StandardCharsets;
+import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+
+import org.eclipse.paho.client.mqttv3.*;
+import org.testng.Reporter;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.mircom.iot.utils.MetricsCollector2;
+
+public class DeviceWorker {
+	
+	
+
+	    private static final String AWS_ENDPOINT =
+	            "ssl://auyhz7hlcxtop-ats.iot.us-west-1.amazonaws.com:8883";
+
+	    private final DeviceInfo device;
+	    
+	    /**
+	     * Constructor for DeviceWorker.
+	     *
+	     * @param device the DeviceInfo object containing device details
+	     */
+
+	    public DeviceWorker(DeviceInfo device) {
+	        this.device = device;
+	    }
+
+	    
+	    /**
+	     * Executes the device worker, connecting to the MQTT broker and publishing messages.
+	     *
+	     * @throws Exception if an error occurs during execution
+	     */
+	    public void execute() throws Exception {
+
+	        String clientId =
+	                "Device-" + UUID.randomUUID();
+
+	        MqttClient client =
+	                new MqttClient(
+	                        AWS_ENDPOINT,
+	                        clientId);
+
+	        MqttConnectOptions options =
+	                new MqttConnectOptions();
+
+	        options.setSocketFactory(
+	                AwsIotSslUtil.getSocketFactory(
+	                        device.getP12Path(),
+	                        device.getPassword()));
+
+	        CountDownLatch latch =
+	                new CountDownLatch(1);
+
+	        long startTime = System.currentTimeMillis();
+
+	        String responseTopic =
+	                "t10/" +
+	                        device.getDeviceId() +
+	                        "/device/event/response";
+
+	        client.setCallback(
+	                new MqttCallback() {
+
+//	                    @Override
+//	                    public void connectionLost(
+//	                            Throwable cause) {
+//
+//	                        cause.printStackTrace();
+//	                    }
+	                    
+	                    @Override
+	                    public void connectionLost(
+	                            Throwable cause) {
+
+	                        System.out.println(
+	                                "\nMQTT Connection Lost");
+
+	                        System.out.println(
+	                                "Device : "
+	                                        + device.getDeviceId());
+
+	                        System.out.println(
+	                                "Reason : "
+	                                        + cause.getMessage());
+
+	                        cause.printStackTrace();
+
+	                        MetricsCollector2.addResult(
+	                                new ResultInfo(
+	                                        device.getDeviceId(),
+	                                        0,
+	                                        false));
+
+	                        latch.countDown();
+	                    }
+
+						/*
+						 * @Override public void messageArrived( String topic, MqttMessage message) {
+						 * 
+						 * long latency = System.currentTimeMillis() - startTime;
+						 * 
+						 * System.out.println( "\nResponse Received");
+						 * 
+						 * 
+						 * System.out.println( "Topic : " + topic);
+						 * 
+						 * System.out.println( "Latency : " + latency + " ms");
+						 * 
+						 * 
+						 * MetricsCollector.addResult(
+						 * 
+						 * new ResultInfo(
+						 * 
+						 * device.getDeviceId(),
+						 * 
+						 * latency,
+						 * 
+						 * true));
+						 * 
+						 * System.out.println( "Payload : " + new String( message.getPayload(),
+						 * StandardCharsets.UTF_8));
+						 * 
+						 * latch.countDown(); }
+						 */
+	                    
+	                    @Override
+	                    public void messageArrived(
+	                    String topic,
+	                    MqttMessage message) {
+	                    long latency =
+	                            System.currentTimeMillis()
+	                                    - startTime;
+
+	                    System.out.println(
+	                            "\nResponse Received");
+
+	                    System.out.println(
+	                            "Topic : " + topic);
+
+	                    System.out.println(
+	                            "Latency : "
+	                                    + latency
+	                                    + " ms");
+
+	                    String response =
+	                            new String(
+	                                    message.getPayload(),
+	                                    StandardCharsets.UTF_8);
+
+	                    System.out.println(
+	                            "Payload : "
+	                                    + response);
+
+	                    try {
+
+	                        ObjectMapper mapper =
+	                                new ObjectMapper();
+
+	                        JsonNode root =
+	                                mapper.readTree(response);
+
+	                        String correlationToken =
+	                                root.path("event")
+	                                    .path("header")
+	                                    .path("correlationToken")
+	                                    .asText();
+
+	                        JsonNode deviceStatus =
+	                                root.path("event")
+	                                    .path("payload")
+	                                    .path("deviceStatuses")
+	                                    .get(0);
+
+	                        String responseDeviceId =
+	                                deviceStatus.path("deviceId")
+	                                            .asText();
+
+	                        boolean success =
+	                                deviceStatus.path("success")
+	                                            .asBoolean();
+
+	                        String status =
+	                                deviceStatus.path("status")
+	                                            .asText();
+
+	                        // DeviceId Validation
+	                        if (!responseDeviceId.equals(
+	                                device.getDeviceId())) {
+
+	                            System.out.println(
+	                                    "DeviceId Mismatch");
+
+	                            MetricsCollector2.addResult(
+	                                    new ResultInfo(
+	                                            device.getDeviceId(),
+	                                            latency,
+	                                            false));
+
+	                            latch.countDown();
+	                            return;
+	                        }
+
+	                        // Correlation Token Validation
+	                        if (!correlationToken.equals(
+	                                device.getDeviceId())) {
+
+	                            System.out.println(
+	                                    "Correlation Token Mismatch");
+
+	                            MetricsCollector2.addResult(
+	                                    new ResultInfo(
+	                                            device.getDeviceId(),
+	                                            latency,
+	                                            false));
+
+	                            latch.countDown();
+	                            return;
+	                        }
+
+	                        // Success Validation
+	                        if (!success) {
+
+	                            System.out.println(
+	                                    "Discovery Success = false");
+
+	                            MetricsCollector2.addResult(
+	                                    new ResultInfo(
+	                                            device.getDeviceId(),
+	                                            latency,
+	                                            false));
+
+	                            latch.countDown();
+	                            return;
+	                        }
+
+	                        // Status Validation
+	                        if (!(status.equals("CREATED")
+	                                || status.equals("UPDATED"))) {
+
+	                            System.out.println(
+	                                    "Invalid Status : "
+	                                            + status);
+
+	                            MetricsCollector2.addResult(
+	                                    new ResultInfo(
+	                                            device.getDeviceId(),
+	                                            latency,
+	                                            false));
+
+	                            latch.countDown();
+	                            return;
+	                        }
+
+	                        System.out.println(
+	                                "Discovery Validation Passed");
+
+	                        MetricsCollector2.addResult(
+	                                new ResultInfo(
+	                                        device.getDeviceId(),
+	                                        latency,
+	                                        true));
+
+	                    } catch (Exception e) {
+
+	                        e.printStackTrace();
+
+	                        MetricsCollector2.addResult(
+	                                new ResultInfo(
+	                                        device.getDeviceId(),
+	                                        latency,
+	                                        false));
+	                    }
+
+	                    latch.countDown();
+	                   
+
+	                    }
+
+
+	                    @Override
+	                    public void deliveryComplete(
+	                            IMqttDeliveryToken token) {
+	                    }
+	                });
+
+//	        System.out.println(
+//	                "Connecting Device : "
+//	                        + device.getDeviceId());
+	        
+	        System.out.println(
+	        	    Thread.currentThread().getName()
+	        	    + " -> Connecting Device : "
+	        	    + device.getDeviceId());
+	        long connectStart = System.currentTimeMillis();
+	        client.connect(options);
+	        long connectEnd = System.currentTimeMillis();
+	        
+	        System.out.println(
+	        	    "Connect Time : "
+	        	    + (connectEnd - connectStart)
+	        	    + " ms");
+
+	        System.out.println(
+	                "Connected Successfully");
+	        
+	       // Reporter.log("Connected Successfully");
+
+	        client.subscribe(responseTopic, 1);
+
+	        System.out.println(
+	                "Subscribed : "
+	                        + responseTopic);
+	        
+	       // Reporter.log(
+	             //   "Subscribed : "
+	                 //       + responseTopic);
+
+	        String publishTopic =
+	                "t10/"
+	                        + device.getDeviceId()
+	                        + "/server/event/discovery";
+
+	        String payload =
+	               "{\n"
+	                + "   \"event\":{\n"
+	                + "      \"header\":{\n"
+	                + "         \"namespace\":\"KfbAccess.Discovery\",\n"
+	                + "         \"name\":\"AddOrUpdateDevices\",\n"
+	                + "         \"messageId\":\"54fc009a-0f3f-4f15-9e20-483daa812445\",\n"
+	                + "         \"correlationToken\":\""+device.getDeviceId()+"\",\n"
+	                + "         \"payloadVersion\":\"3\"\n"
+	                + "      },\n"
+	                + "      \"payload\":{\n"
+	                + "         \"devices\":[\n"
+	                + "            {\n"
+	                + "               \"deviceId\":\""+device.getDeviceId()+"\",\n"
+	                + "               \"model\":\"TX3-T10\",\n"
+	                + "               \"displayName\":\"TX3-T10 kapil kumar\",\n"
+	                + "               \"location\":{\n"
+	                + "                  \"locationId\":\"47f01fd5-2e2e-4f4e-a524-8dfc6f7c6d20\",\n"
+	                + "                  \"locationName\":\"My Desk\",\n"
+	                + "                  \"unitCount\":2,\n"
+	                + "                  \"address\":{\n"
+	                + "                     \"addressLine1\":\"5 Interchannge Way\",\n"
+	                + "                     \"city\":\"Vaughan\",\n"
+	                + "                     \"stateOrRegion\":\"Ontario\",\n"
+	                + "                     \"postalCode\":\"L4K 5W3\",\n"
+	                + "                     \"countryCode\":\"US\"\n"
+	                + "                  }\n"
+	                + "               },\n"
+	                + "               \"capabilities\":[\n"
+	                + "                  {\n"
+	                + "                     \"type\":\"KfbAccessInterface\",\n"
+	                + "                     \"interface\":\"KfbAccess.AccessPointController\",\n"
+	                + "                     \"version\":\"3\",\n"
+	                + "                     \"properties\":{\n"
+	                + "                        \"supported\":[\n"
+	                + "                           {\n"
+	                + "                              \"name\":\"accessPointState\"\n"
+	                + "                           }\n"
+	                + "                        ],\n"
+	                + "                        \"retrievable\":false\n"
+	                + "                     }\n"
+	                + "                  },\n"
+	                + "                  {\n"
+	                + "                     \"type\":\"KfbAccessInterface\",\n"
+	                + "                     \"interface\":\"KfbAccess.DeviceHealth\",\n"
+	                + "                     \"version\":\"3\",\n"
+	                + "                     \"properties\":{\n"
+	                + "                        \"supported\":[\n"
+	                + "                           {\n"
+	                + "                              \"name\":\"connectivity\"\n"
+	                + "                           }\n"
+	                + "                        ],\n"
+	                + "                        \"retrievable\":true\n"
+	                + "                     }\n"
+	                + "                  },\n"
+	                + "                  {\n"
+	                + "                     \"type\":\"KfbAccessInterface\",\n"
+	                + "                     \"interface\":\"KfbAccess.DeviceHealth.Deep\",\n"
+	                + "                     \"version\":\"3\",\n"
+	                + "                     \"properties\":{\n"
+	                + "                        \"supported\":[\n"
+	                + "                           {\n"
+	                + "                              \"name\":\"connectivity\"\n"
+	                + "                           }\n"
+	                + "                        ],\n"
+	                + "                        \"retrievable\":false\n"
+	                + "                     }\n"
+	                + "                  },\n"
+	                + "                  {\n"
+	                + "                     \"type\":\"KfbAccessInterface\",\n"
+	                + "                     \"interface\":\"KfbAccess\",\n"
+	                + "                     \"version\":\"3\"\n"
+	                + "                  }\n"
+	                + "               ],\n"
+	                + "               \"additionalAttributes\":{\n"
+	                + "                  \"manufacturer\":\"Mircom Technologies Ltd\",\n"
+	                + "                  \"serialNumber\":\"3AH021605\",\n"
+	                + "                  \"firmwareVersion\":\"3.7.15\",\n"
+	                + "                  \"notes\":\"There is nothing to be delivered\",\n"
+	                + "                  \"panelId\":\"3935952614\",\n"
+	                + "                  \"isAWSKfBEnabled\":true\n"
+	                + "               }\n"
+	                + "            },\n"
+	                + "            {\n"
+	                + "               \"deviceId\":\"d2e8a6d8-4c95-4b1f-92f8-7a9e7a3c1b4f\",\n"
+	                + "               \"model\":\"TX3-T10-Elevator\",\n"
+	                + "               \"displayName\":\"TX3-T10 Arash - Elevator\",\n"
+	                + "               \"location\":{\n"
+	                + "                  \"locationId\":\"47f01fd5-2e2e-4f4e-a524-8dfc6f7c6d20\",\n"
+	                + "                  \"locationName\":\"My Desk\",\n"
+	                + "                  \"unitCount\":2,\n"
+	                + "                  \"address\":{\n"
+	                + "                     \"addressLine1\":\"5 Interchannge Way\",\n"
+	                + "                     \"city\":\"Vaughan\",\n"
+	                + "                     \"stateOrRegion\":\"Ontario\",\n"
+	                + "                     \"postalCode\":\"L4K 5W3\",\n"
+	                + "                     \"countryCode\":\"US\"\n"
+	                + "                  }\n"
+	                + "               },\n"
+	                + "               \"capabilities\":[\n"
+	                + "                  {\n"
+	                + "                     \"type\":\"KfbAccessInterface\",\n"
+	                + "                     \"interface\":\"KfbAccess.StopFloorElevatorAccessPointController\",\n"
+	                + "                     \"version\":\"3\"\n"
+	                + "                  },\n"
+	                + "                  {\n"
+	                + "                     \"type\":\"KfbAccessInterface\",\n"
+	                + "                     \"interface\":\"KfbAccess.DeviceHealth\",\n"
+	                + "                     \"version\":\"3\",\n"
+	                + "                     \"properties\":{\n"
+	                + "                        \"supported\":[\n"
+	                + "                           {\n"
+	                + "                              \"name\":\"connectivity\"\n"
+	                + "                           }\n"
+	                + "                        ],\n"
+	                + "                        \"retrievable\":true\n"
+	                + "                     }\n"
+	                + "                  },\n"
+	                + "                  {\n"
+	                + "                     \"type\":\"KfbAccessInterface\",\n"
+	                + "                     \"interface\":\"KfbAccess.DeviceHealth.Deep\",\n"
+	                + "                     \"version\":\"3\",\n"
+	                + "                     \"properties\":{\n"
+	                + "                        \"supported\":[\n"
+	                + "                           {\n"
+	                + "                              \"name\":\"connectivity\"\n"
+	                + "                           }\n"
+	                + "                        ],\n"
+	                + "                        \"retrievable\":false\n"
+	                + "                     }\n"
+	                + "                  },\n"
+	                + "                  {\n"
+	                + "                     \"type\":\"KfbAccessInterface\",\n"
+	                + "                     \"interface\":\"KfbAccess\",\n"
+	                + "                     \"version\":\"3\"\n"
+	                + "                  }\n"
+	                + "               ],\n"
+	                + "               \"additionalAttributes\":{\n"
+	                + "                  \"elevatorSecurity\":\"CALL_RESTRICTION\",\n"
+	                + "                  \"notes\":\"Elevator unit controller\",\n"
+	                + "                  \"isAWSKfBEnabled\":false\n"
+	                + "               }\n"
+	                + "            }\n"
+	                + "         ]\n"
+	                + "      }\n"
+	                + "   }\n"
+	                + "}";
+
+	        client.publish(
+	                publishTopic,
+	                new MqttMessage(
+	                        payload.getBytes(
+	                                StandardCharsets.UTF_8)));
+
+//	        System.out.println(
+//	                "Published Successfully");
+//
+//	        latch.await(
+//	                30,
+//	                TimeUnit.SECONDS);
+//
+//	        client.disconnect();
+//
+//	        client.close();
+	        
+	        boolean responseReceived =
+	                latch.await(
+	                        30,
+	                        TimeUnit.SECONDS);
+
+	        if (!responseReceived) {
+
+	            System.out.println(
+	                    "\nTimeout for device : "
+	                            + device.getDeviceId());
+
+	            MetricsCollector2.addResult(
+	                    new ResultInfo(
+	                            device.getDeviceId(),
+	                            30000,
+	                            false));
+
+	            System.out.println(
+	                    "Failure recorded for : "
+	                            + device.getDeviceId());
+	        }
+
+	        client.disconnect();
+
+	        client.close();
+	    }
+	    }
