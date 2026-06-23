@@ -1,0 +1,160 @@
+package com.mircom.iot.model;
+
+import java.nio.charset.StandardCharsets;
+import java.time.Instant;
+import java.time.temporal.ChronoUnit;
+import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+
+import org.eclipse.paho.client.mqttv3.IMqttDeliveryToken;
+import org.eclipse.paho.client.mqttv3.MqttCallback;
+import org.eclipse.paho.client.mqttv3.MqttClient;
+import org.eclipse.paho.client.mqttv3.MqttConnectOptions;
+import org.eclipse.paho.client.mqttv3.MqttMessage;
+import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence;
+
+public class HeartbeatWorker1 {
+	
+	private static final String AWS_ENDPOINT =
+            "ssl://auyhz7hlcxtop-ats.iot.us-west-1.amazonaws.com:8883";
+
+    private final DeviceInfo device;
+
+    public HeartbeatWorker1(DeviceInfo device) {
+        this.device = device;
+    }
+
+    public String execute() throws Exception {
+
+        String clientId = "Heartbeat-" + UUID.randomUUID();
+
+        // MemoryPersistence — no disk I/O on connect
+        MqttClient client = new MqttClient(
+                AWS_ENDPOINT,
+                clientId,
+                new MemoryPersistence());
+
+        MqttConnectOptions options = new MqttConnectOptions();
+
+      
+        options.setSocketFactory(
+                AwsIotSslUtil.getSocketFactory(
+                        device.getP12Path(),
+                        device.getPassword()));
+
+        options.setCleanSession(true);
+       
+        CountDownLatch connectLatch = new CountDownLatch(1);
+        final boolean[] connectionFailed = {false};
+
+        client.setCallback(new MqttCallback() {
+
+            @Override
+            public void connectionLost(Throwable cause) {
+                System.out.println("\nMQTT Connection Lost");
+                System.out.println("Device : " + device.getDeviceId());
+                System.out.println("Reason : " + cause.getMessage());
+                cause.printStackTrace();
+                connectionFailed[0] = true;
+                connectLatch.countDown();
+            }
+
+            @Override
+            public void messageArrived(String topic, MqttMessage message) {
+                
+            }
+
+            @Override
+            public void deliveryComplete(IMqttDeliveryToken token) {
+               
+                connectLatch.countDown();
+            }
+        });
+
+        System.out.println(
+                Thread.currentThread().getName()
+                + " -> Connecting Device : "
+                + device.getDeviceId());
+
+        long connectStart = System.currentTimeMillis();
+        client.connect(options);
+        System.out.println(
+                "Connect Time : "
+                + (System.currentTimeMillis() - connectStart)
+                + " ms");
+        System.out.println("Connected Successfully");
+
+        String heartbeatTopic =
+                "t10/" + device.getDeviceId() + "/server/telemetry/heartbeat";
+
+        
+        String timeOfSample = Instant.now()
+                .truncatedTo(ChronoUnit.SECONDS)
+                .toString();
+
+        String payload = buildHeartbeatPayload(timeOfSample);
+
+        // QoS 1 — guarantees at-least-once delivery instead of fire-and-forget
+        MqttMessage msg = new MqttMessage(payload.getBytes(StandardCharsets.UTF_8));
+        msg.setQos(1);
+        client.publish(heartbeatTopic, msg);
+
+        // Wait for deliveryComplete confirmation (up to 10 seconds)
+        boolean delivered = connectLatch.await(10, TimeUnit.SECONDS);
+
+        if (!delivered) {
+            System.out.println("WARNING: Heartbeat delivery not confirmed for : "
+                    + device.getDeviceId());
+        } else if (connectionFailed[0]) {
+            System.out.println("WARNING: Connection lost during heartbeat for : "
+                    + device.getDeviceId());
+        } else {
+            System.out.println("Heartbeat Sent");
+            System.out.println("Topic   : " + heartbeatTopic);
+            System.out.println("Payload : " + payload);
+        }
+
+        client.disconnect();
+        client.close();
+        System.out.println("Disconnected Successfully");
+
+        return timeOfSample;
+    }
+
+    private String buildHeartbeatPayload(String timeOfSample) {
+        return """
+                {
+                  "event": {
+                    "header": {
+                      "namespace": "Telemetry",
+                      "name": "DeviceHeartbeat",
+                      "messageId": "%s",
+                      "correlationToken": "%s",
+                      "payloadVersion": "3"
+                    },
+                    "payload": {},
+                    "device": {
+                      "deviceId": "%s"
+                    }
+                  },
+                  "context": {
+                    "properties": [
+                      {
+                        "namespace": "KfbAccess.DeviceHealth",
+                        "name": "connectivity",
+                        "value": "OK",
+                        "timeOfSample": "%s",
+                        "uncertaintyInMilliseconds": 0
+                      }
+                    ]
+                  }
+                }
+                """.formatted(
+                        UUID.randomUUID(),
+                        UUID.randomUUID(),
+                        device.getDeviceId(),
+                        timeOfSample);
+    }
+
+}
