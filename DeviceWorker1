@@ -1,0 +1,345 @@
+package com.mircom.iot.model;
+
+	
+	
+
+	import com.fasterxml.jackson.databind.JsonNode;
+	import com.fasterxml.jackson.databind.ObjectMapper;
+import com.mircom.iot.utils.MetricsCollector;
+import com.mircom.iot.utils.MetricsCollector2;
+	import org.eclipse.paho.client.mqttv3.*;
+	import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence;
+
+	import java.nio.charset.StandardCharsets;
+	import java.util.UUID;
+	import java.util.concurrent.CountDownLatch;
+	import java.util.concurrent.TimeUnit;
+
+	public class DeviceWorker1 {
+
+	    private static final String AWS_ENDPOINT =
+	            "ssl://auyhz7hlcxtop-ats.iot.us-west-1.amazonaws.com:8883";
+
+	    private static final ObjectMapper MAPPER = new ObjectMapper();
+
+	    private final DeviceInfo device;
+
+	    public DeviceWorker1(DeviceInfo device) {
+	        this.device = device;
+	    }
+
+	    public void execute() throws Exception {
+
+	        String clientId = "Device-" + UUID.randomUUID();
+
+	        MqttClient client = new MqttClient(
+	                AWS_ENDPOINT,
+	                clientId,
+	                new MemoryPersistence());
+
+	        MqttConnectOptions options = new MqttConnectOptions();
+	        options.setSocketFactory(
+	                AwsIotSslUtil.getSocketFactory(
+	                        device.getP12Path(),
+	                        device.getPassword()));
+	        options.setCleanSession(true);
+
+	        CountDownLatch latch = new CountDownLatch(1);
+	        final long[] startTime = {0};
+
+	        String responseTopic =
+	                "t10/" + device.getDeviceId() + "/device/event/response";
+
+	        client.setCallback(new MqttCallback() {
+
+	            @Override
+	            public void connectionLost(Throwable cause) {
+	                System.out.println("\nMQTT Connection Lost");
+	                System.out.println("Device : " + device.getDeviceId());
+	                System.out.println("Reason : " + cause.getMessage());
+	                cause.printStackTrace();
+	                MetricsCollector2.addResult(
+	                        new ResultInfo(device.getDeviceId(), 0, false));
+	                latch.countDown();
+	            }
+
+	            @Override
+	            public void messageArrived(
+	                    String topic,
+	                    MqttMessage message) {
+
+	                long latency = System.currentTimeMillis() - startTime[0];
+
+	                System.out.println("\nResponse Received");
+	                System.out.println("Topic   : " + topic);
+	                System.out.println("Latency : " + latency + " ms");
+
+	                String response =
+	                        new String(message.getPayload(), StandardCharsets.UTF_8);
+	                System.out.println("Payload : " + response);
+
+	                try {
+	                    JsonNode root = MAPPER.readTree(response);
+
+	                    String correlationToken =
+	                            root.path("event")
+	                                .path("header")
+	                                .path("correlationToken")
+	                                .asText();
+
+	                    JsonNode deviceStatus =
+	                            root.path("event")
+	                                .path("payload")
+	                                .path("deviceStatuses")
+	                                .get(0);
+
+	                    String responseDeviceId =
+	                            deviceStatus.path("deviceId").asText();
+	                    boolean success =
+	                            deviceStatus.path("success").asBoolean();
+	                    String status =
+	                            deviceStatus.path("status").asText();
+
+	                    if (!responseDeviceId.equals(device.getDeviceId())) {
+	                        System.out.println("DeviceId Mismatch");
+	                        MetricsCollector.addResult(
+	                                new ResultInfo(device.getDeviceId(), latency, false));
+	                        latch.countDown();
+	                        return;
+	                    }
+
+	                    if (!correlationToken.equals(device.getDeviceId())) {
+	                        System.out.println("Correlation Token Mismatch");
+	                        MetricsCollector.addResult(
+	                                new ResultInfo(device.getDeviceId(), latency, false));
+	                        latch.countDown();
+	                        return;
+	                    }
+
+	                    if (!success) {
+	                        System.out.println("Discovery Success = false");
+	                        MetricsCollector.addResult(
+	                                new ResultInfo(device.getDeviceId(), latency, false));
+	                        latch.countDown();
+	                        return;
+	                    }
+
+	                    if (!(status.equals("CREATED") || status.equals("UPDATED")|| status.equals("DELETED"))) {
+	                        System.out.println("Invalid Status : " + status);
+	                        MetricsCollector.addResult(
+	                                new ResultInfo(device.getDeviceId(), latency, false));
+	                        latch.countDown();
+	                        return;
+	                    }
+
+	                    System.out.println("Discovery Validation Passed");
+	                    MetricsCollector.addResult(
+	                            new ResultInfo(device.getDeviceId(), latency, true));
+
+	                } catch (Exception e) {
+	                    e.printStackTrace();
+	                    MetricsCollector.addResult(
+	                            new ResultInfo(device.getDeviceId(), latency, false));
+	                }
+
+	                latch.countDown();
+	            }
+
+	            @Override
+	            public void deliveryComplete(IMqttDeliveryToken token) {}
+	        });
+
+	        System.out.println(
+	                Thread.currentThread().getName()
+	                + " -> Connecting Device : "
+	                + device.getDeviceId());
+	        
+	        long connectStart = System.currentTimeMillis();
+	        client.connect(options);
+	        System.out.println(
+	                "Connect Time : "
+	                + (System.currentTimeMillis() - connectStart)
+	                + " ms");
+	        System.out.println("Connected Successfully");
+
+	        client.subscribe(responseTopic, 1);
+	        System.out.println("Subscribed : " + responseTopic);
+
+	        String publishTopic =
+	                "t10/" + device.getDeviceId() + "/server/event/discovery";
+
+	        String payload = buildPayload(device.getDeviceId());
+
+	        startTime[0] = System.currentTimeMillis();
+
+	        MqttMessage msg =
+	                new MqttMessage(payload.getBytes(StandardCharsets.UTF_8));
+	        msg.setQos(1);
+	        client.publish(publishTopic, msg);
+
+	        boolean responseReceived = latch.await(30, TimeUnit.SECONDS);
+
+	        if (!responseReceived) {
+	            System.out.println("\nTimeout for device : " + device.getDeviceId());
+	            MetricsCollector2.addResult(
+	                    new ResultInfo(device.getDeviceId(), 30000, false));
+	            System.out.println("Failure recorded for : " + device.getDeviceId());
+	        }
+
+	        client.disconnect();
+	        client.close();
+	    }
+
+	    private String buildPayload(String deviceId) {
+	        return "{\n"
+	            + "   \"event\":{\n"
+	            + "      \"header\":{\n"
+	            + "         \"namespace\":\"KfbAccess.Discovery\",\n"
+	            + "         \"name\":\"AddOrUpdateDevices\",\n"
+	            + "         \"messageId\":\"" + UUID.randomUUID() + "\",\n"
+	            + "         \"correlationToken\":\"" + deviceId + "\",\n"
+	            + "         \"payloadVersion\":\"3\"\n"
+	            + "      },\n"
+	            + "      \"payload\":{\n"
+	            + "         \"devices\":[\n"
+	            + "            {\n"
+	            + "               \"deviceId\":\"" + deviceId + "\",\n"
+	            + "               \"model\":\"TX3-T10\",\n"
+	            + "               \"displayName\":\"TX3-T10 kapil kumar\",\n"
+	            + "               \"location\":{\n"
+	            + "                  \"locationId\":\"47f01fd5-2e2e-4f4e-a524-8dfc6f7c6d20\",\n"
+	            + "                  \"locationName\":\"My Desk\",\n"
+	            + "                  \"unitCount\":2,\n"
+	            + "                  \"address\":{\n"
+	            + "                     \"addressLine1\":\"5 Interchannge Way\",\n"
+	            + "                     \"city\":\"Vaughan\",\n"
+	            + "                     \"stateOrRegion\":\"Ontario\",\n"
+	            + "                     \"postalCode\":\"L4K 5W3\",\n"
+	            + "                     \"countryCode\":\"US\"\n"
+	            + "                  }\n"
+	            + "               },\n"
+	            + "               \"capabilities\":[\n"
+	            + "                  {\n"
+	            + "                     \"type\":\"KfbAccessInterface\",\n"
+	            + "                     \"interface\":\"KfbAccess.AccessPointController\",\n"
+	            + "                     \"version\":\"3\",\n"
+	            + "                     \"properties\":{\n"
+	            + "                        \"supported\":[\n"
+	            + "                           {\n"
+	            + "                              \"name\":\"accessPointState\"\n"
+	            + "                           }\n"
+	            + "                        ],\n"
+	            + "                        \"retrievable\":false\n"
+	            + "                     }\n"
+	            + "                  },\n"
+	            + "                  {\n"
+	            + "                     \"type\":\"KfbAccessInterface\",\n"
+	            + "                     \"interface\":\"KfbAccess.DeviceHealth\",\n"
+	            + "                     \"version\":\"3\",\n"
+	            + "                     \"properties\":{\n"
+	            + "                        \"supported\":[\n"
+	            + "                           {\n"
+	            + "                              \"name\":\"connectivity\"\n"
+	            + "                           }\n"
+	            + "                        ],\n"
+	            + "                        \"retrievable\":true\n"
+	            + "                     }\n"
+	            + "                  },\n"
+	            + "                  {\n"
+	            + "                     \"type\":\"KfbAccessInterface\",\n"
+	            + "                     \"interface\":\"KfbAccess.DeviceHealth.Deep\",\n"
+	            + "                     \"version\":\"3\",\n"
+	            + "                     \"properties\":{\n"
+	            + "                        \"supported\":[\n"
+	            + "                           {\n"
+	            + "                              \"name\":\"connectivity\"\n"
+	            + "                           }\n"
+	            + "                        ],\n"
+	            + "                        \"retrievable\":false\n"
+	            + "                     }\n"
+	            + "                  },\n"
+	            + "                  {\n"
+	            + "                     \"type\":\"KfbAccessInterface\",\n"
+	            + "                     \"interface\":\"KfbAccess\",\n"
+	            + "                     \"version\":\"3\"\n"
+	            + "                  }\n"
+	            + "               ],\n"
+	            + "               \"additionalAttributes\":{\n"
+	            + "                  \"manufacturer\":\"Mircom Technologies Ltd\",\n"
+	            + "                  \"serialNumber\":\"3AH021605\",\n"
+	            + "                  \"firmwareVersion\":\"3.7.15\",\n"
+	            + "                  \"notes\":\"There is nothing to be delivered\",\n"
+	            + "                  \"panelId\":\"3935952614\",\n"
+	            + "                  \"isAWSKfBEnabled\":true\n"
+	            + "               }\n"
+	            + "            },\n"
+	            + "            {\n"
+	            + "               \"deviceId\":\"d2e8a6d8-4c95-4b1f-92f8-7a9e7a3c1b4f\",\n"
+	            + "               \"model\":\"TX3-T10-Elevator\",\n"
+	            + "               \"displayName\":\"TX3-T10 Arash - Elevator\",\n"
+	            + "               \"location\":{\n"
+	            + "                  \"locationId\":\"47f01fd5-2e2e-4f4e-a524-8dfc6f7c6d20\",\n"
+	            + "                  \"locationName\":\"My Desk\",\n"
+	            + "                  \"unitCount\":2,\n"
+	            + "                  \"address\":{\n"
+	            + "                     \"addressLine1\":\"5 Interchannge Way\",\n"
+	            + "                     \"city\":\"Vaughan\",\n"
+	            + "                     \"stateOrRegion\":\"Ontario\",\n"
+	            + "                     \"postalCode\":\"L4K 5W3\",\n"
+	            + "                     \"countryCode\":\"US\"\n"
+	            + "                  }\n"
+	            + "               },\n"
+	            + "               \"capabilities\":[\n"
+	            + "                  {\n"
+	            + "                     \"type\":\"KfbAccessInterface\",\n"
+	            + "                     \"interface\":\"KfbAccess.StopFloorElevatorAccessPointController\",\n"
+	            + "                     \"version\":\"3\"\n"
+	            + "                  },\n"
+	            + "                  {\n"
+	            + "                     \"type\":\"KfbAccessInterface\",\n"
+	            + "                     \"interface\":\"KfbAccess.DeviceHealth\",\n"
+	            + "                     \"version\":\"3\",\n"
+	            + "                     \"properties\":{\n"
+	            + "                        \"supported\":[\n"
+	            + "                           {\n"
+	            + "                              \"name\":\"connectivity\"\n"
+	            + "                           }\n"
+	            + "                        ],\n"
+	            + "                        \"retrievable\":true\n"
+	            + "                     }\n"
+	            + "                  },\n"
+	            + "                  {\n"
+	            + "                     \"type\":\"KfbAccessInterface\",\n"
+	            + "                     \"interface\":\"KfbAccess.DeviceHealth.Deep\",\n"
+	            + "                     \"version\":\"3\",\n"
+	            + "                     \"properties\":{\n"
+	            + "                        \"supported\":[\n"
+	            + "                           {\n"
+	            + "                              \"name\":\"connectivity\"\n"
+	            + "                           }\n"
+	            + "                        ],\n"
+	            + "                        \"retrievable\":false\n"
+	            + "                     }\n"
+	            + "                  },\n"
+	            + "                  {\n"
+	            + "                     \"type\":\"KfbAccessInterface\",\n"
+	            + "                     \"interface\":\"KfbAccess\",\n"
+	            + "                     \"version\":\"3\"\n"
+	            + "                  }\n"
+	            + "               ],\n"
+	            + "               \"additionalAttributes\":{\n"
+	            + "                  \"elevatorSecurity\":\"CALL_RESTRICTION\",\n"
+	            + "                  \"notes\":\"Elevator unit controller\",\n"
+	            + "                  \"isAWSKfBEnabled\":true\n"
+	            + "               }\n"
+	            + "            }\n"
+	            + "         ]\n"
+	            + "      }\n"
+	            + "   }\n"
+	            + "}";
+	    }
+	    
+	    
+	}
+
+
