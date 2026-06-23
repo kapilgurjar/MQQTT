@@ -1,0 +1,419 @@
+package com.mircom.iot.iot_load_test;
+
+import java.time.Duration;
+import java.time.Instant;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+
+import org.testng.Assert;
+import org.testng.annotations.Test;
+
+import com.mircom.iot.model.AwsIotSslUtil;
+import com.mircom.iot.model.DeviceInfo;
+import com.mircom.iot.model.DeviceWorker1;
+import com.mircom.iot.model.DeviceWorkerNew;
+import com.mircom.iot.model.HeartbeatWorker1;
+import com.mircom.iot.model.ResultInfo;
+import com.mircom.iot.utils.CsvReaderUtil;
+import com.mircom.iot.utils.DynamoDBClientProvider;
+import com.mircom.iot.utils.MetricsCollector;
+import com.mircom.iot.utils.ReportGenerator;
+
+public class DiscoveryAndHeartbeatValidationTest {
+	private static final Set<String> failedDevices =
+            Collections.synchronizedSet(
+                    new HashSet<>());
+	
+	
+	
+	@Test(invocationCount = 1)
+	public void validateDiscoveryAndHeartbeatFlow() {
+		
+		failedDevices.clear();
+		MetricsCollector.clear();
+
+		try {
+		    List<DeviceInfo> devices = CsvReaderUtil.readDevices(
+		            "./src/main/resources/devices.csv");
+
+		    System.out.println("Total Devices : " + devices.size());
+
+		    
+		    System.out.println("Pre-loading SSL factories...");
+		    for (DeviceInfo device : devices) {
+		        AwsIotSslUtil.getSocketFactory(
+		                device.getP12Path(),
+		                device.getPassword());
+		    }
+		    System.out.println("SSL ready. Starting test...");
+
+		  
+		    ExecutorService executor = Executors.newFixedThreadPool(50);
+
+		   
+		    CountDownLatch completionLatch = new CountDownLatch(devices.size());
+
+		    for (DeviceInfo device : devices) {
+		    	executor.submit(() -> {
+		    	    try {
+		    	        System.out.println("Starting Discovery : " + device.getDeviceId());
+		    	        new DeviceWorkerNew(device).execute();
+		    	        
+
+		    	        boolean discovered = waitForDeviceInDB(device.getDeviceId(), 30, 2);
+		    	        if (!discovered) {
+		    	            throw new Exception(
+		    	                    "Device not found in DB after discovery : "
+		    	                    + device.getDeviceId());
+		    	        }
+
+		    	        System.out.println("Starting Heartbeat : " + device.getDeviceId());
+		    	        String sentTime = new HeartbeatWorker1(device).execute();
+		    	        System.out.println("Heartbeat Sent Time : " + sentTime);
+
+		    	        String dbTime = waitForHeartbeatInDB(device.getDeviceId(), sentTime, 30, 2);
+		    	        System.out.println("DB Heartbeat Time : " + dbTime);
+//
+//		    	        if (!sentTime.equals(dbTime)) {
+//		    	            throw new AssertionError(
+//		    	                    "Heartbeat timestamp mismatch for device "
+//		    	                    + device.getDeviceId()
+//		    	                    + " | sent=" + sentTime
+//		    	                    + " | db=" + dbTime);
+//		    	        }
+		    	        
+		    	        
+		    	        Instant sent = Instant.parse(sentTime);
+		    	        Instant db = Instant.parse(dbTime);
+
+		    	        long diff =
+		    	                Math.abs(Duration.between(sent, db).getSeconds());
+
+		    	        if (diff > 2) {
+		    	            throw new AssertionError(
+		    	                    "Heartbeat timestamp mismatch for device "
+		    	                    + device.getDeviceId()
+		    	                    + " | sent=" + sentTime
+		    	                    + " | db=" + dbTime
+		    	                    + " | diff=" + diff + " sec");
+		    	        }
+		    	        
+
+		    	    } catch (AssertionError ae) {
+		    	        failedDevices.add(device.getDeviceId());
+		    	        System.out.println("\nAssertion Failed : " + device.getDeviceId());
+		    	        System.out.println(ae.getMessage());
+		    	       
+		    	        MetricsCollector.addResult(
+		    	                new ResultInfo(device.getDeviceId(), 0, false));
+
+		    	    } catch (Exception e) {
+		    	        failedDevices.add(device.getDeviceId());
+		    	        System.out.println("\nFailed Device : " + device.getDeviceId());
+		    	        e.printStackTrace();
+		    	        MetricsCollector.addResult(
+		    	                new ResultInfo(device.getDeviceId(), 0, false));
+
+		    	    } finally {
+		    	        completionLatch.countDown();
+		    	    }
+		    	});
+		    	
+		    	 Thread.sleep(50);
+		    }
+
+		    
+		    boolean allFinished = completionLatch.await(10, TimeUnit.MINUTES);
+		    if (!allFinished) {
+		        System.err.println("WARNING: Test timed out — not all devices completed");
+		    }
+
+		    executor.shutdown();
+
+		   
+		    long failed = MetricsCollector.getResults()
+		            .stream()
+		            .filter(r -> !r.isSuccess())
+		            .count();
+
+		    if (MetricsCollector.getResults().size() != devices.size()) {
+		        System.out.println(
+		                "WARNING: Missing results. Started="
+		                + devices.size()
+		                + " Recorded="
+		                + MetricsCollector.getResults().size());
+		    }
+
+		    MetricsCollector.printSummary();
+		    
+		    List<ResultInfo> slowestDevices = MetricsCollector.getResults().stream()
+		            .filter(ResultInfo::isSuccess)
+		            .sorted((r1, r2) -> Long.compare(r2.getLatency(), r1.getLatency()))
+		            .limit(5)
+		            .toList();
+
+		    ReportGenerator.generateReport(
+		            MetricsCollector.getResults(),
+		            MetricsCollector.getAverageLatency(),
+		            MetricsCollector.getP95(),
+		            MetricsCollector.getP99(),
+		            MetricsCollector.getSuccessCount(),
+		            MetricsCollector.getFailureCount(),
+		            devices.size(),
+		    		slowestDevices);
+		    		
+		  
+
+		    System.out.println("\n========== FAILED DEVICES ==========");
+		    failedDevices.forEach(System.out::println);
+		    System.out.println("Total Failed : " + failedDevices.size());
+		    System.out.println("====================================");
+
+		    System.out.println("Devices Started  : " + devices.size());
+		    System.out.println("Results Recorded : " + MetricsCollector.getResults().size());
+
+		    
+		    Assert.assertEquals(
+		            failed,
+		            0L,
+		            "Some devices failed. See FAILED DEVICES list above.");
+
+		} catch (Exception e) {
+		    e.printStackTrace();
+		}
+		
+	}
+	
+	
+	@Test()
+	public void validateDiscoveryAndHeartbeatFlow1() {
+		
+		failedDevices.clear();
+		MetricsCollector.clear();
+
+		try {
+		    List<DeviceInfo> devices = CsvReaderUtil.readDevices(
+		            "./src/main/resources/devices.csv");
+
+		    System.out.println("Total Devices : " + devices.size());
+
+		    
+		    System.out.println("Pre-loading SSL factories...");
+		    for (DeviceInfo device : devices) {
+		        AwsIotSslUtil.getSocketFactory(
+		                device.getP12Path(),
+		                device.getPassword());
+		    }
+		    System.out.println("SSL ready. Starting test...");
+
+		  
+		    ExecutorService executor = Executors.newFixedThreadPool(50);
+
+		   
+		    CountDownLatch completionLatch = new CountDownLatch(devices.size());
+
+		    for (DeviceInfo device : devices) {
+		    	executor.submit(() -> {
+		    	    try {
+		    	        System.out.println("Starting Discovery : " + device.getDeviceId());
+		    	        new DeviceWorker1(device).execute();
+		    	        
+
+		    	        boolean discovered = waitForDeviceInDB(device.getDeviceId(), 30, 2);
+		    	        if (!discovered) {
+		    	            throw new Exception(
+		    	                    "Device not found in DB after discovery : "
+		    	                    + device.getDeviceId());
+		    	        }
+
+		    	        System.out.println("Starting Heartbeat : " + device.getDeviceId());
+		    	        String sentTime = new HeartbeatWorker1(device).execute();
+		    	        System.out.println("Heartbeat Sent Time : " + sentTime);
+
+		    	        String dbTime = waitForHeartbeatInDB(device.getDeviceId(), sentTime, 30, 2);
+		    	        System.out.println("DB Heartbeat Time : " + dbTime);
+//
+//		    	        if (!sentTime.equals(dbTime)) {
+//		    	            throw new AssertionError(
+//		    	                    "Heartbeat timestamp mismatch for device "
+//		    	                    + device.getDeviceId()
+//		    	                    + " | sent=" + sentTime
+//		    	                    + " | db=" + dbTime);
+//		    	        }
+		    	        
+		    	        
+		    	        Instant sent = Instant.parse(sentTime);
+		    	        Instant db = Instant.parse(dbTime);
+
+		    	        long diff =
+		    	                Math.abs(Duration.between(sent, db).getSeconds());
+
+		    	        if (diff > 2) {
+		    	            throw new AssertionError(
+		    	                    "Heartbeat timestamp mismatch for device "
+		    	                    + device.getDeviceId()
+		    	                    + " | sent=" + sentTime
+		    	                    + " | db=" + dbTime
+		    	                    + " | diff=" + diff + " sec");
+		    	        }
+		    	        
+
+		    	    } catch (AssertionError ae) {
+		    	        failedDevices.add(device.getDeviceId());
+		    	        System.out.println("\nAssertion Failed : " + device.getDeviceId());
+		    	        System.out.println(ae.getMessage());
+		    	       
+		    	        MetricsCollector.addResult(
+		    	                new ResultInfo(device.getDeviceId(), 0, false));
+
+		    	    } catch (Exception e) {
+		    	        failedDevices.add(device.getDeviceId());
+		    	        System.out.println("\nFailed Device : " + device.getDeviceId());
+		    	        e.printStackTrace();
+		    	        MetricsCollector.addResult(
+		    	                new ResultInfo(device.getDeviceId(), 0, false));
+
+		    	    } finally {
+		    	        completionLatch.countDown();
+		    	    }
+		    	});
+		    	
+		    	 Thread.sleep(50);
+		    }
+
+		    
+		    boolean allFinished = completionLatch.await(10, TimeUnit.MINUTES);
+		    if (!allFinished) {
+		        System.err.println("WARNING: Test timed out — not all devices completed");
+		    }
+
+		    executor.shutdown();
+
+		   
+		    long failed = MetricsCollector.getResults()
+		            .stream()
+		            .filter(r -> !r.isSuccess())
+		            .count();
+
+		    if (MetricsCollector.getResults().size() != devices.size()) {
+		        System.out.println(
+		                "WARNING: Missing results. Started="
+		                + devices.size()
+		                + " Recorded="
+		                + MetricsCollector.getResults().size());
+		    }
+
+		    MetricsCollector.printSummary();
+		    
+		    List<ResultInfo> slowestDevices = MetricsCollector.getResults().stream()
+		            .filter(ResultInfo::isSuccess)
+		            .sorted((r1, r2) -> Long.compare(r2.getLatency(), r1.getLatency()))
+		            .limit(5)
+		            .toList();
+
+		    ReportGenerator.generateReport(
+		            MetricsCollector.getResults(),
+		            MetricsCollector.getAverageLatency(),
+		            MetricsCollector.getP95(),
+		            MetricsCollector.getP99(),
+		            MetricsCollector.getSuccessCount(),
+		            MetricsCollector.getFailureCount(),
+		            devices.size(),
+		    		slowestDevices);
+		    		
+		    
+		  
+
+		    System.out.println("\n========== FAILED DEVICES ==========");
+		    failedDevices.forEach(System.out::println);
+		    System.out.println("Total Failed : " + failedDevices.size());
+		    System.out.println("====================================");
+
+		    System.out.println("Devices Started  : " + devices.size());
+		    System.out.println("Results Recorded : " + MetricsCollector.getResults().size());
+
+		    
+		    Assert.assertEquals(
+		            failed,
+		            0L,
+		            "Some devices failed. See FAILED DEVICES list above.");
+
+		} catch (Exception e) {
+		    e.printStackTrace();
+		}
+		
+	}
+	
+	/**
+	 * Polls DynamoDB until the device appears, or times out.
+	 *
+	 * @param deviceId    device to check
+	 * @param timeoutSec  max seconds to wait
+	 * @param intervalSec seconds between each poll
+	 * @return true if device found, false if timed out
+	 */
+	private boolean waitForDeviceInDB(
+	        String deviceId,
+	        int timeoutSec,
+	        int intervalSec) throws InterruptedException {
+
+	    int elapsed = 0;
+	    while (elapsed < timeoutSec) {
+	        try {
+	            Map<String, String> details =
+	                    DynamoDBClientProvider.getDeviceDetails(deviceId);
+	            if (details != null && !details.isEmpty()) {
+	                return true;
+	            }
+	        } catch (Exception ignored) {}
+
+	        Thread.sleep(intervalSec * 1000L);
+	        elapsed += intervalSec;
+	    }
+	    return false;
+	}
+
+	/**
+	 * Polls DynamoDB until lastHeartbeatAt matches sentTime, or times out.
+	 *
+	 * @param deviceId    device to check
+	 * @param sentTime    expected timestamp
+	 * @param timeoutSec  max seconds to wait
+	 * @param intervalSec seconds between each poll
+	 * @return the matched DB timestamp, or the last seen value if timed out
+	 */
+	private String waitForHeartbeatInDB(
+	        String deviceId,
+	        String sentTime,
+	        int timeoutSec,
+	        int intervalSec) throws InterruptedException {
+
+	    int elapsed = 0;
+	    String dbTime = null;
+	    while (elapsed < timeoutSec) {
+	        try {
+	            Map<String, String> details =
+	                    DynamoDBClientProvider.getDeviceDetails(deviceId);
+	            dbTime = details.get("lastHeartbeatAt");
+	            if (sentTime.equals(dbTime)) {
+	                return dbTime;
+	            }
+	        } catch (Exception ignored) {}
+
+	        Thread.sleep(intervalSec * 1000L);
+	        elapsed += intervalSec;
+	    }
+	    return dbTime; 
+	}
+	
+
+	
+
+}
