@@ -1,0 +1,184 @@
+package com.mircom.iot.utils;
+import java.util.*;
+
+import org.testng.Reporter;
+
+import com.mircom.iot.model.ResultInfo;
+
+public class MetricsCollector2 {
+	
+	 private static final List<ResultInfo> results =
+	            Collections.synchronizedList(
+	                    new ArrayList<>());
+
+	    public static void addResult(
+	            ResultInfo result) {
+
+	        results.add(result);
+	    }
+
+	    public static List<ResultInfo> getResults() {
+	    	
+	    	
+
+	        return results;
+	    }
+	    
+	    /**
+	     * Clears the collected results.
+	     */
+	    public static void printSummary() {
+
+	        List<ResultInfo> results =
+	                getResults();
+
+	        int total =
+	                results.size();
+
+	        long successCount =
+	                results.stream()
+	                        .filter(ResultInfo::isSuccess)
+	                        .count();
+
+	        long failureCount =
+	                total - successCount;
+
+	        double avgLatency =
+	                results.stream()
+	                        .filter(ResultInfo::isSuccess)
+	                        .mapToLong(ResultInfo::getLatency)
+	                        .average()
+	                        .orElse(0);
+
+	        System.out.println(
+	                "\n========================");
+
+	        System.out.println(
+	                "Total Requests : "
+	                        + total);
+
+	        System.out.println(
+	                "Success : "
+	                        + successCount);
+
+	        System.out.println(
+	                "Failed : "
+	                        + failureCount);
+
+	        System.out.println(
+	                "Average Latency : "
+	                        + avgLatency
+	                        + " ms");
+
+	        System.out.println(
+	                "========================");
+	        
+	        List<Long> latencies =
+	                results.stream()
+	                        .filter(ResultInfo::isSuccess)
+	                        .map(ResultInfo::getLatency)
+	                        .sorted()
+	                        .toList();
+
+	        long p95 =
+	                percentile(
+	                        latencies,
+	                        0.95);
+
+	        long p99 =
+	                percentile(
+	                        latencies,
+	                        0.99);
+	        
+	        System.out.println(
+	                "P95 Latency : "
+	                        + p95
+	                        + " ms");
+
+	        System.out.println(
+	                "P99 Latency : "
+	                        + p99
+	                        + " ms");
+	        
+	        double successRate =
+	                (successCount * 100.0)
+	                        / total;
+	        
+	        System.out.println(
+	                "Success Rate : "
+	                        + successRate
+	                        + "%");
+	        
+	     
+	    }
+	    
+	    /**
+	     * Calculates the specified percentile from a sorted list of latencies.
+	     *
+	     * @param sortedLatencies the sorted list of latencies
+	     * @param percentile      the desired percentile (e.g., 0.95 for 95th percentile)
+	     * @return the latency value at the specified percentile
+	     */
+	    public static long percentile(
+	            List<Long> latencies,
+	            double percentile) {
+
+	        List<Long> sorted =
+	                new ArrayList<>(latencies);
+
+	        Collections.sort(sorted);
+
+	        int index =
+	                (int) Math.ceil(
+	                        percentile * sorted.size()) - 1;
+
+	        return sorted.get(index);
+	    }
+	    
+	    
+	    public static double getAverageLatency() {
+
+	        return results.stream()
+	                .filter(ResultInfo::isSuccess)
+	                .mapToLong(ResultInfo::getLatency)
+	                .average()
+	                .orElse(0);
+	    }
+	    
+	    public static long getSuccessCount() {
+
+	        return results.stream()
+	                .filter(ResultInfo::isSuccess)
+	                .count();
+	    }
+	    
+	    public static long getFailureCount() {
+
+	        return results.size() - getSuccessCount();
+	    }
+	    
+	    public static long getP95() {
+
+	        List<Long> latencies =
+	                results.stream()
+	                        .filter(ResultInfo::isSuccess)
+	                        .map(ResultInfo::getLatency)
+	                        .sorted()
+	                        .toList();
+
+	        return percentile(latencies, 0.95);
+	    }
+	    
+	    public static long getP99() {
+
+	        List<Long> latencies =
+	                results.stream()
+	                        .filter(ResultInfo::isSuccess)
+	                        .map(ResultInfo::getLatency)
+	                        .sorted()
+	                        .toList();
+
+	        return percentile(latencies, 0.99);
+	    }
+
+}
